@@ -1,0 +1,9 @@
+# The challenge data stays on your machine. Never commit it.
+data/
+*.zip
+usage.jsonl
+output.json
+out*.json
+.env
+__pycache__/
+.DS_Store
