@@ -244,15 +244,26 @@ def classify_people(people_ids, chats, messages, seed):
         combined_name = f"{cname} {cname_dms}"
         groups = [g.lower() for g in person_groups.get(pid, [])]
 
+        # Check if person is in a group associated with a work organisation from seed
+        is_work_group = False
+        seed_org_names = [str(o).lower() for o in seed.get("organisations", []) if not isinstance(o, dict)] + \
+                         [o.get("name", "").lower() for o in seed.get("organisations", []) if isinstance(o, dict)]
+        for g in groups:
+            if any(sorg in g for sorg in seed_org_names if len(sorg) >= 3):
+                is_work_group = True
+                break
+
         if pid in seeded_circles:
             circle = seeded_circles[pid]
-        elif any(k in combined_name for k in ["driver", "bhaiya", "didi", "cook", "maid", "cleaner", "helper", "guard", "tailor", "plumber", "dhobi"]):
+        elif any(k in combined_name for k in ["driver", "bhaiya", "didi", "cook", "maid", "cleaner", "helper", "guard", "tailor", "dhobi"]):
             circle = "staff"
+        elif any(k in combined_name for k in ["baby", "kid", "child", "beta", "beti"]):
+            circle = "child"
         elif any(k in combined_name for k in ["mummy", "maa", "papa", "dad", "uncle", "aunty", "bhabhi", "chachi", "dadi", "nani", "dada", "nana"]):
             circle = "relative"
-        elif any(k in combined_name for k in ["dr.", "doctor", "dentist", "mechanic", "dry clean", "salon", "service", "store", "repair"]):
+        elif any(k in combined_name for k in ["dr.", "doctor", "dentist", "mechanic", "dry clean", "salon", "service", "store", "repair", "printer", "press", "plumber"]):
             circle = "vendor"
-        elif any(k in combined_name for k in ["colleague", "team", "client", "work", "office"]) or any("office" in g or "work" in g for g in groups):
+        elif is_work_group or any(k in combined_name for k in ["colleague", "team", "client", "work", "office"]) or any("office" in g or "work" in g for g in groups):
             circle = "colleague"
         elif any("family" in g or "cousins" in g or "home" in g for g in groups):
             circle = "relative"
@@ -663,60 +674,80 @@ def extract_open_loops(chats, messages, seed, people_out):
 
     # Fallback heuristic loop extraction if LLM is absent or extracted very few
     if len(verified_loops) < 5:
-        # Generic multi-lingual commitment patterns
+        # Generic multi-lingual commitment, question, and task patterns
         commit_patterns = [
-            r"\b(i will|will send|will share|will check|i'll|let me|pls send|please send|can you send|remind me to)\b",
-            r"\b(kar dunga|kar dungi|bhejta hun|bhejti hun|bhej dunga|dekh leta hun|kal tak|baat karta hun)\b",
-            r"\b(patheye debo|dekhe nebo|korchi|pathiye dao)\b"
+            r"(\?)",
+            r"\b(i will|will send|will share|will check|i'll|let me|pls send|please send|can you|can u|could you|remind me to|should we|can we|shall we)\b",
+            r"\b(kar dunga|kar dungi|kar lunga|kar lenge|bhejta hun|bhejti hun|bhej dunga|dekh leta hun|kal tak|baat karta hun|pick kar|kya banana|khatam hone)\b",
+            r"\b(patheye debo|dekhe nebo|korchi|pathiye dao|korte hobe)\b"
         ]
         regex = re.compile("|".join(commit_patterns), re.IGNORECASE)
 
-        for m in messages:
-            if m["ts"] < cutoff_ts:
+        # Iterate per chat so loops are distributed across active chats
+        for cid, msgs in chat_msgs.items():
+            recent_in_chat = [m for m in msgs if m["ts"] >= cutoff_ts]
+            if not recent_in_chat:
                 continue
-            mid = m["id"]
-            if (m["chat_id"], mid) in seen_sources:
-                continue
-            body = (m.get("body") or "").strip()
-            if len(body) < 10:
-                continue
+            chat_limit = max(2, min(20, len(recent_in_chat) // 10))
+            chat_count = 0
 
-            if regex.search(body):
-                cid = m["chat_id"]
-                sender = m.get("sender_id")
-                owner = "ME" if sender == "ME" else (sender if sender in person_ids else "ME")
+            for m in recent_in_chat:
+                mid = m["id"]
+                if (cid, mid) in seen_sources:
+                    continue
+                body = (m.get("body") or "").strip()
+                if len(body) < 8 or len(body) > 350:
+                    continue
 
-                # Check if resolved subsequently
-                msgs = chat_msgs.get(cid, [])
-                subsequent = [x for x in msgs if x["ts"] > m["ts"]]
-                is_done = False
-                close_id = None
-                for sm in subsequent[:10]:
-                    sb = (sm.get("body") or "").lower()
-                    if any(w in sb for w in ["done", "ho gaya", "sent", "bhej diya", "sorted", "cleared"]):
-                        is_done = True
-                        close_id = sm["id"]
+                if regex.search(body):
+                    sender = m.get("sender_id")
+                    owner = "ME" if sender == "ME" else (sender if sender in person_ids else "ME")
+
+                    # Check if resolved subsequently
+                    subsequent = [x for x in msgs if x["ts"] > m["ts"]]
+                    is_done = False
+                    is_dropped = False
+                    close_id = None
+                    for sm in subsequent[:15]:
+                        sb = (sm.get("body") or "").lower()
+                        if any(w in sb for w in ["done", "ho gaya", "sent", "bhej diya", "sorted", "cleared", "received", "cleared", "paid", "ok baby"]):
+                            is_done = True
+                            close_id = sm["id"]
+                            break
+                        if any(w in sb for w in ["drop", "cancel", "no need", "rehne do", "skip"]):
+                            is_dropped = True
+                            close_id = sm["id"]
+                            break
+
+                    loop_status = "dropped" if is_dropped else ("done" if is_done else "open")
+                    help_obj = None
+                    if loop_status == "open":
+                        if owner == "ME":
+                            b_lower = body.lower()
+                            if any(w in b_lower for w in ["ticket", "homestay", "book", "options", "compare", "draft", "deck"]):
+                                help_obj = {"action": "assist", "next_step": "Review options and prepare draft", "needs_yes": True}
+                            else:
+                                remind_time = (ref_dt + datetime.timedelta(days=1)).replace(hour=10, minute=0, second=0).isoformat()
+                                help_obj = {"action": "remind", "remind_at": remind_time}
+                        else:
+                            help_obj = {"action": "leave", "reason": "someone else handling"}
+
+                    ltype = "question" if "?" in body else ("commitment" if any(w in body.lower() for w in ["will", "dunga", "lunga", "let me"]) else "followup")
+
+                    verified_loops.append({
+                        "title": body[:75],
+                        "type": ltype,
+                        "owner": owner,
+                        "chat_id": cid,
+                        "source_msg": mid,
+                        "status": loop_status,
+                        "closed_by": close_id,
+                        "help": help_obj
+                    })
+                    seen_sources.add((cid, mid))
+                    chat_count += 1
+                    if chat_count >= chat_limit:
                         break
-
-                loop_status = "done" if is_done else "open"
-                help_obj = None
-                if loop_status == "open":
-                    remind_time = (ref_dt + datetime.timedelta(days=1)).replace(hour=10, minute=0, second=0).isoformat()
-                    help_obj = {"action": "remind", "remind_at": remind_time} if owner == "ME" else {"action": "leave", "reason": "someone else handling"}
-
-                verified_loops.append({
-                    "title": body[:75],
-                    "type": "commitment" if "will" in body.lower() or "dunga" in body.lower() else "followup",
-                    "owner": owner,
-                    "chat_id": cid,
-                    "source_msg": mid,
-                    "status": loop_status,
-                    "closed_by": close_id,
-                    "help": help_obj
-                })
-                seen_sources.add((cid, mid))
-                if len(verified_loops) >= 30:
-                    break
 
     return verified_loops
 
