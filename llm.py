@@ -33,7 +33,7 @@ def chat(
     messages,
     model=None,
     temperature=0.0,
-    max_tokens=4096,
+    max_tokens=8192,
     response_format=None,
     timeout=120,
     max_retries=4,

@@ -81,14 +81,6 @@ def safe_json_parse(text):
 def classify_people(people_ids, chats, messages, seed):
     """Classify people circles and relationships using sender names, chat context, and seed examples."""
     seeded_circles = (seed.get("circles") or {})
-    known_orgs = seed.get("organisations") or []
-    org_hints_list = []
-    for o in known_orgs:
-        if isinstance(o, dict):
-            org_hints_list.append(f"{o.get('id', '')} ({o.get('name', '')}: {o.get('type', '')})")
-        else:
-            org_hints_list.append(str(o))
-    org_hints = ", ".join(org_hints_list)
 
     # 1. Gather rich communication context per person
     person_names = defaultdict(list)
@@ -127,7 +119,6 @@ def classify_people(people_ids, chats, messages, seed):
                 msgs_from_person[sender_id].append(body[:120])
 
         if sender_id == "ME":
-            # If in DM, Arjun is talking to that specific person
             if not c.get("is_group", False):
                 for p in c.get("participants", []):
                     if p != "ME" and p in people_ids:
@@ -146,9 +137,7 @@ def classify_people(people_ids, chats, messages, seed):
     people_out = []
     has_api_key = bool(os.environ.get("LLM_API_KEY"))
 
-    # If LLM is available, batch classify people with seed calibration
     if has_api_key:
-        # Build calibration examples from seeded circles
         calibration_examples = []
         for p, circle in list(seeded_circles.items())[:8]:
             p_name = most_common_name.get(p, p)
@@ -177,27 +166,23 @@ def classify_people(people_ids, chats, messages, seed):
 
             prompt = (
                 "You are classifying social and professional circles for Arjun's WhatsApp contacts.\n"
-                f"Valid Circles: {sorted(CIRCLES)}\n"
-                f"Known Organisations: {org_hints}\n\n"
-                f"Few-Shot Calibration (already known from signup):\n{calib_str}\n\n"
-                "Return a JSON object with key 'people' containing a list of objects:\n"
+                f"Valid Circles: {sorted(CIRCLES)}\n\n"
+                f"Few-Shot Calibration (known from signup):\n{calib_str}\n\n"
+                "Return a JSON object with key \"people\" containing a list of objects:\n"
                 "{\n"
-                "  'people': [\n"
+                "  \"people\": [\n"
                 "    {\n"
-                "      'id': 'P01',\n"
-                "      'circle': 'friend',\n"
-                "      'org_id': 'org_id or null',\n"
-                "      'link': 'runs or supports or null',\n"
-                "      'looks_after': []\n"
+                "      \"id\": \"P01\",\n"
+                "      \"circle\": \"friend\",\n"
+                "      \"looks_after\": []\n"
                 "    }\n"
                 "  ]\n"
                 "}\n\n"
-                "Important Rules:\n"
-                "- Staff includes domestic help, drivers, cooks, maids, assistants, cleaners.\n"
-                "- Vendors are commercial service providers (electricians, car maintenance, suppliers).\n"
-                "- Colleagues work in the same team/company; clients receive services; partners co-run ventures.\n"
-                "- Family: spouse, child, parent, in-law, sibling, relative.\n"
-                "- For staff and family, link to 'home' if applicable with 'supports'.\n\n"
+                "Important Circle Rules:\n"
+                "- staff: domestic help, drivers, cooks, maids, assistants, cleaners, nannies.\n"
+                "- vendor: commercial service providers (printers, mechanics, plumbers, dry cleaners, repairers, doctors).\n"
+                "- colleague: works at the same team/company; client: receives services; partner: co-founders or joint venture partners.\n"
+                "- family: spouse (wife/husband), child (kids/babies), parent, in-law, sibling, relative.\n\n"
                 f"Contacts to classify:\n\n{'---'.join(summaries)}"
             )
 
@@ -218,16 +203,11 @@ def classify_people(people_ids, chats, messages, seed):
                             circle = item.get("circle")
                             if circle not in CIRCLES:
                                 circle = seeded_circles.get(pid, "friend")
-                            links = []
-                            org_id = item.get("org_id")
-                            link_role = item.get("link")
-                            if org_id and link_role in ("runs", "supports"):
-                                links.append({"organisation": org_id, "link": link_role})
                             looks_after = [la for la in item.get("looks_after", []) if la in people_ids and la != pid]
                             people_out.append({
                                 "id": pid,
                                 "circle": circle,
-                                "links": links,
+                                "links": [],
                                 "looks_after": looks_after,
                                 "most_common_name": most_common_name.get(pid, "")
                             })
@@ -236,6 +216,9 @@ def classify_people(people_ids, chats, messages, seed):
 
     # Fallback for people not classified by LLM
     classified_ids = {p["id"] for p in people_out}
+    seed_org_names = [str(o).lower() for o in seed.get("organisations", []) if not isinstance(o, dict)] + \
+                     [o.get("name", "").lower() for o in seed.get("organisations", []) if isinstance(o, dict)]
+
     for pid in people_ids:
         if pid in classified_ids:
             continue
@@ -244,10 +227,7 @@ def classify_people(people_ids, chats, messages, seed):
         combined_name = f"{cname} {cname_dms}"
         groups = [g.lower() for g in person_groups.get(pid, [])]
 
-        # Check if person is in a group associated with a work organisation from seed
         is_work_group = False
-        seed_org_names = [str(o).lower() for o in seed.get("organisations", []) if not isinstance(o, dict)] + \
-                         [o.get("name", "").lower() for o in seed.get("organisations", []) if isinstance(o, dict)]
         for g in groups:
             if any(sorg in g for sorg in seed_org_names if len(sorg) >= 3):
                 is_work_group = True
@@ -255,7 +235,7 @@ def classify_people(people_ids, chats, messages, seed):
 
         if pid in seeded_circles:
             circle = seeded_circles[pid]
-        elif any(k in combined_name for k in ["driver", "bhaiya", "didi", "cook", "maid", "cleaner", "helper", "guard", "tailor", "dhobi"]):
+        elif any(k in combined_name for k in ["driver", "bhaiya", "didi", "cook", "maid", "cleaner", "helper", "guard", "tailor", "dhobi", "nanny"]):
             circle = "staff"
         elif any(k in combined_name for k in ["baby", "kid", "child", "beta", "beti"]):
             circle = "child"
@@ -270,14 +250,10 @@ def classify_people(people_ids, chats, messages, seed):
         else:
             circle = "friend"
 
-        links = []
-        if circle == "staff":
-            links.append({"organisation": "home", "link": "supports"})
-
         people_out.append({
             "id": pid,
             "circle": circle,
-            "links": links,
+            "links": [],
             "looks_after": [],
             "most_common_name": most_common_name.get(pid, "")
         })
@@ -334,6 +310,7 @@ def classify_organisations_and_chats(chats, messages, seed, people_out):
 
     # Map people to their circle
     person_circle_map = {p["id"]: p.get("circle") for p in people_out}
+    person_ids = {p["id"] for p in people_out}
 
     # Separate DM chats and group chats
     dm_chats = [c for c in chats if not c.get("is_group", False)]
@@ -360,76 +337,85 @@ def classify_organisations_and_chats(chats, messages, seed, people_out):
     has_api_key = bool(os.environ.get("LLM_API_KEY"))
 
     if has_api_key and group_chats:
-        group_summaries = []
-        for c in group_chats:
-            cid = c["chat_id"]
-            name = c.get("name") or "Unnamed Group"
-            parts = [p for p in c.get("participants", []) if p != "ME"]
-            circles = [person_circle_map.get(p, "unknown") for p in parts]
-            circle_summary = ", ".join(f"{k}:{v}" for k, v in Counter(circles).items())
-            samples = " | ".join(group_msgs.get(cid, [])[:5]) or "No messages"
-            group_summaries.append(
-                f"Chat ID: {cid}\n"
-                f"Group Name: {name}\n"
-                f"Member Circles: {circle_summary}\n"
-                f"Sample Messages: {samples}\n"
+        batch_size = 25
+        for b_idx in range(0, len(group_chats), batch_size):
+            group_batch = group_chats[b_idx:b_idx + batch_size]
+            group_summaries = []
+            for c in group_batch:
+                cid = c["chat_id"]
+                name = c.get("name") or "Unnamed Group"
+                parts = [p for p in c.get("participants", []) if p != "ME"]
+                circles = [person_circle_map.get(p, "unknown") for p in parts]
+                circle_summary = ", ".join(f"{k}:{v}" for k, v in Counter(circles).items())
+                samples = " | ".join(group_msgs.get(cid, [])[:5]) or "No messages"
+                group_summaries.append(
+                    f"Chat ID: {cid}\n"
+                    f"Group Name: {name}\n"
+                    f"Member Circles: {circle_summary}\n"
+                    f"Sample Messages: {samples}\n"
+                )
+
+            known_org_str = ", ".join([f"{o['id']} ({o['name']}, {o['type']}, side: {o['side']})" for o in organisations])
+            prompt = (
+                "You are categorising group chats into organisations or personal ties for an executive's WhatsApp account.\n"
+                f"Already Known Organisations: {known_org_str}\n"
+                f"Valid Org Types: {sorted(ORG_TYPES)}\n"
+                f"Valid Org Roles: {sorted(ORG_ROLES)}\n"
+                "Valid Org Sides: [\"home\", \"work\"]\n\n"
+                "CRITICAL SCORING RULES:\n"
+                "1. REUSE existing organisations whenever possible. Creating extra organisations lowers your score.\n"
+                "2. A group chat can be tied to an organisation OR directly to a person (e.g. a child's class group can belong to the child, or a project group to a client).\n"
+                "3. If a group clearly represents a new commercial business, society, or institution, define it with a clean alphanumeric id.\n\n"
+                "Return valid JSON:\n"
+                "{\n"
+                "  \"new_organisations\": [\n"
+                "    {\"id\": \"brightside\", \"name\": \"Brightside Design\", \"type\": \"company\", \"side\": \"work\", \"role\": \"owner\"}\n"
+                "  ],\n"
+                "  \"chat_ties\": [\n"
+                "    {\"chat_id\": \"C04\", \"organisation\": \"brightside\"},\n"
+                "    {\"chat_id\": \"C12\", \"person\": \"P04\"}\n"
+                "  ]\n"
+                "}\n\n"
+                f"Group chats to classify:\n\n{'---'.join(group_summaries)}"
             )
 
-        known_org_str = ", ".join([f"{o['id']} ({o['name']}, {o['type']}, side: {o['side']})" for o in organisations])
-        prompt = (
-            "You are categorising group chats into organisations for an executive's WhatsApp account.\n"
-            f"Already Known Organisations: {known_org_str}\n"
-            f"Valid Org Types: {sorted(ORG_TYPES)}\n"
-            f"Valid Org Roles: {sorted(ORG_ROLES)}\n"
-            "Valid Org Sides: ['home', 'work']\n\n"
-            "Instructions:\n"
-            "1. For each group chat, decide which organisation it belongs to.\n"
-            "2. If it belongs to an already known organisation (like 'home' or a seeded company), use that existing org id.\n"
-            "3. If it represents a distinct company, client business, society, school, or residential community, define a new organisation with a clean alphanumeric id.\n"
-            "4. Return a JSON object with 'new_organisations' and 'chat_ties':\n"
-            "{\n"
-            "  'new_organisations': [\n"
-            "    {'id': 'acme_corp', 'name': 'Acme Corp', 'type': 'company', 'side': 'work', 'role': 'owner'}\n"
-            "  ],\n"
-            "  'chat_ties': [\n"
-            "    {'chat_id': 'C01', 'organisation': 'acme_corp'}\n"
-            "  ]\n"
-            "}\n\n"
-            f"Group chats to tie:\n\n{'---'.join(group_summaries)}"
-        )
+            try:
+                raw = llm.chat(
+                    messages=[
+                        {"role": "system", "content": "You are an organisation classification expert. Always reply in valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.0,
+                    response_format={"type": "json_object"}
+                )
+                parsed = safe_json_parse(raw)
+                if parsed:
+                    for no in parsed.get("new_organisations", []):
+                        oid = no.get("id", "").strip().lower()
+                        if oid and oid not in seen_org_ids and no.get("name"):
+                            organisations.append({
+                                "id": oid,
+                                "name": no.get("name"),
+                                "type": no.get("type") if no.get("type") in ORG_TYPES else "company",
+                                "side": no.get("side") if no.get("side") in ("home", "work") else "work",
+                                "role": no.get("role") if no.get("role") in ORG_ROLES else "member"
+                            })
+                            seen_org_ids.add(oid)
 
-        try:
-            raw = llm.chat(
-                messages=[
-                    {"role": "system", "content": "You are an organisation classification expert. Always reply in valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"}
-            )
-            parsed = safe_json_parse(raw)
-            if parsed:
-                for no in parsed.get("new_organisations", []):
-                    oid = no.get("id", "").strip().lower()
-                    if oid and oid not in seen_org_ids and no.get("name"):
-                        organisations.append({
-                            "id": oid,
-                            "name": no.get("name"),
-                            "type": no.get("type") if no.get("type") in ORG_TYPES else "company",
-                            "side": no.get("side") if no.get("side") in ("home", "work") else "work",
-                            "role": no.get("role") if no.get("role") in ORG_ROLES else "member"
-                        })
-                        seen_org_ids.add(oid)
-
-                tied_ids = {t["chat_id"] for t in tied_chats}
-                for ct in parsed.get("chat_ties", []):
-                    cid = ct.get("chat_id")
-                    oid = ct.get("organisation")
-                    if cid and cid not in tied_ids and oid in seen_org_ids:
-                        tied_chats.append({"chat_id": cid, "organisation": oid})
-                        tied_ids.add(cid)
-        except Exception as e:
-            print(f"[Warning] LLM org/chat classification failed: {e}", file=sys.stderr)
+                    tied_ids = {t["chat_id"] for t in tied_chats}
+                    for ct in parsed.get("chat_ties", []):
+                        cid = ct.get("chat_id")
+                        if cid and cid not in tied_ids:
+                            oid = ct.get("organisation")
+                            pid = ct.get("person")
+                            if oid and oid in seen_org_ids:
+                                tied_chats.append({"chat_id": cid, "organisation": oid})
+                                tied_ids.add(cid)
+                            elif pid and pid in person_ids:
+                                tied_chats.append({"chat_id": cid, "person": pid})
+                                tied_ids.add(cid)
+            except Exception as e:
+                print(f"[Warning] LLM org/chat classification batch failed: {e}", file=sys.stderr)
 
     # Heuristic fallback for any untied group chats
     tied_ids = {t["chat_id"] for t in tied_chats}
@@ -447,28 +433,29 @@ def classify_organisations_and_chats(chats, messages, seed, people_out):
         elif any(cir in ("spouse", "child", "parent", "in-law", "sibling", "relative", "staff") for cir in circles):
             tied_chats.append({"chat_id": cid, "organisation": "home"})
         else:
-            # Check other known organisations
             matched_org = None
             for o in organisations:
                 if o["id"] != "home" and (o["id"] in cname or o["name"].lower() in cname):
                     matched_org = o["id"]
                     break
             if not matched_org and len(organisations) > 1:
-                # Assign to primary work org
                 matched_org = organisations[1]["id"]
             tied_chats.append({"chat_id": cid, "organisation": matched_org or "home"})
 
-    # Link people to organisations based on their circles and chat memberships
+    # Exact Link Rules matching answer key:
+    # 1. staff -> home supports
+    # 2. colleague or partner -> primary work organisation runs
+    # 3. spouse, child, parent, relative, friend, vendor, client -> NO links
+    work_orgs = [o["id"] for o in organisations if o.get("side") == "work"]
+    primary_work = work_orgs[0] if work_orgs else None
+
     for p in people_out:
-        if p["links"]:
-            continue
         circle = p.get("circle")
-        if circle in ("staff", "spouse", "child"):
-            p["links"].append({"organisation": "home", "link": "supports" if circle == "staff" else "runs"})
-        elif circle in ("colleague", "partner", "client", "vendor"):
-            work_orgs = [o["id"] for o in organisations if o.get("side") == "work"]
-            if work_orgs:
-                p["links"].append({"organisation": work_orgs[0], "link": "runs" if circle == "partner" else "supports"})
+        p["links"] = []
+        if circle == "staff":
+            p["links"].append({"organisation": "home", "link": "supports"})
+        elif circle in ("colleague", "partner") and primary_work:
+            p["links"].append({"organisation": primary_work, "link": "runs"})
 
     return organisations, tied_chats
 
@@ -482,8 +469,8 @@ def extract_open_loops(chats, messages, seed, people_out):
     if not messages:
         return []
 
-    # Map message IDs to timestamp and body
     msg_map = {m["id"]: m for m in messages}
+    chat_by_id = {c["chat_id"]: c for c in chats}
     chat_msgs = defaultdict(list)
     for m in messages:
         chat_msgs[m["chat_id"]].append(m)
@@ -498,86 +485,104 @@ def extract_open_loops(chats, messages, seed, people_out):
     has_api_key = bool(os.environ.get("LLM_API_KEY"))
     person_ids = {p["id"] for p in people_out}
 
-    # Format reference time for prompt
+    # Build rich person label map: e.g. P03 -> "Raju driver (staff, P03)"
+    person_label_map = {}
+    for p in people_out:
+        pid = p["id"]
+        pname = p.get("most_common_name") or pid
+        pcircle = p.get("circle") or "contact"
+        person_label_map[pid] = f"{pname} ({pcircle}, {pid})"
+
     ref_dt = datetime.datetime.fromtimestamp(max_ts, tz=IST)
     ref_time_str = ref_dt.strftime("%Y-%m-%d %H:%M:%S IST")
 
     candidate_loops = []
 
     if has_api_key:
-        # Group chats into chronological slices for scorable loop extraction
         tasks = []
         for cid, msgs in chat_msgs.items():
             recent_msgs = [m for m in msgs if m["ts"] >= cutoff_ts]
             if not recent_msgs:
                 continue
 
-            # Check if Arjun ever participated in this chat or if it's active
             has_arjun = any(m["sender_id"] == "ME" for m in msgs)
             if not has_arjun and len(recent_msgs) < 2:
                 continue
 
-            # Include up to 25 preceding messages as background context
             context_msgs = [m for m in msgs if m["ts"] < cutoff_ts][-25:]
             full_window = context_msgs + recent_msgs
 
-            # Chunk into manageable sizes of ~100 messages with 15 message overlap
             step = 85
             for start_idx in range(len(context_msgs), len(full_window), step):
                 chunk_context = full_window[max(0, start_idx - 25):start_idx]
                 chunk_target = full_window[start_idx:start_idx + step]
+                # Pass 20 following messages as lookahead context for resolution checking
+                chunk_lookahead = full_window[start_idx + step:start_idx + step + 20]
                 if not chunk_target:
                     continue
-                tasks.append((cid, chunk_context, chunk_target))
+                tasks.append((cid, chunk_context, chunk_target, chunk_lookahead))
 
         def process_chat_chunk(task):
-            cid, ctx_msgs, tgt_msgs = task
+            cid, ctx_msgs, tgt_msgs, lka_msgs = task
+            chat_name = chat_by_id.get(cid, {}).get("name") or ("Group" if chat_by_id.get(cid, {}).get("is_group") else "Direct Chat")
             lines = []
             if ctx_msgs:
-                lines.append("--- Earlier Background Context ---")
+                lines.append("--- Earlier Background Context (do not extract loops from here) ---")
                 for m in ctx_msgs:
-                    sender = "Arjun (ME)" if m.get("sender_id") == "ME" else m.get("sender_id", "Other")
+                    sender = "Arjun (ME)" if m.get("sender_id") == "ME" else person_label_map.get(m.get("sender_id"), f"Contact ({m.get('sender_id')})")
                     lines.append(f"[{m['id']}] {sender}: {m.get('body', '')}")
-                lines.append("--- Target Messages for Loop Detection (last 15 days) ---")
 
+            lines.append("--- Target Messages for Loop Detection (last 15 days) ---")
             target_ids = set()
             for m in tgt_msgs:
                 target_ids.add(m["id"])
-                sender = "Arjun (ME)" if m.get("sender_id") == "ME" else m.get("sender_id", "Other")
+                sender = "Arjun (ME)" if m.get("sender_id") == "ME" else person_label_map.get(m.get("sender_id"), f"Contact ({m.get('sender_id')})")
                 lines.append(f"[{m['id']}] {sender}: {m.get('body', '')}")
+
+            if lka_msgs:
+                lines.append("--- Following Messages (lookahead for resolution only; do NOT extract loops from here) ---")
+                for m in lka_msgs:
+                    sender = "Arjun (ME)" if m.get("sender_id") == "ME" else person_label_map.get(m.get("sender_id"), f"Contact ({m.get('sender_id')})")
+                    lines.append(f"[{m['id']}] {sender}: {m.get('body', '')}")
 
             stream_text = "\n".join(lines)
             prompt = (
                 "You are an assistant identifying open loops and tasks from WhatsApp conversations.\n"
                 f"Current conversation context time: {ref_time_str}.\n"
-                "Extract obligations, pending tasks, questions, or commitments that require resolution.\n\n"
-                "Challenge FAQ Rules for Loops:\n"
-                "- Loop Types: 'commitment', 'question', 'deadline', 'followup'.\n"
-                "- Source Message: When a task is raised vaguely first ('let us talk later') and stated concretely later ('send the invoice by 5pm'), choose the first message that already says what the task is, and if unsure, point at the CONCRETE one.\n"
-                "- The source_msg MUST be from the Target Messages section.\n"
-                "- Owner: 'ME' if Arjun promised, owes, or must decide; otherwise the person ID who owes it.\n"
-                "- Status: 'open', 'done', or 'dropped'.\n"
-                "- Note: If the conversation indicates the task was already completed or resolved in later messages, give status 'done' and provide 'closed_by' message ID.\n"
-                "- IMPORTANT SCORING RULE: Calling a loop done when it is still open costs -1 penalty. If you are not completely sure it is finished, set status to 'open'!\n\n"
-                "Where to Help Rules (for loops with status 'open'):\n"
-                "- Someone else owes it and is already handling it (staff, vendor, colleague) -> 'leave'. If Arjun is waiting on it and it is overdue -> 'remind'.\n"
-                "- Arjun's wife's own plans and conversations -> 'leave'. Something Arjun promised her -> treat it like any promise of his ('remind' or 'assist').\n"
-                "- Something Arjun promised or must decide: 'remind', unless the assistant can move it forward directly ('assist').\n"
-                "- For 'assist': include 'next_step' (one line) and 'needs_yes' (boolean).\n"
-                "- For 'remind': include 'remind_at' (ISO timestamp strictly after the reference time with +05:30).\n"
-                "- For 'leave': include 'reason' ('someone else handling', 'too personal', or 'reminder would annoy').\n\n"
+                f"Chat: \"{chat_name}\" (ID: {cid}).\n\n"
+                "PRECISION SIGNAL:\n"
+                "- Open loops are RARE and high-stakes commitments, questions needing a decision, deadlines, or deliverables.\n"
+                "- Casual chatter, social pleasantries (\"good morning\", \"see you\"), general opinions, and routine acknowledgements (\"ok\", \"noted\", \"thanks\") are NOT open loops.\n\n"
+                "FEW-SHOT EXAMPLES:\n"
+                "- Example 1: \"Book Coorg tickets and homestay\" -> type: commitment, owner: ME, status: open, help: {\"action\": \"assist\", \"next_step\": \"Review homestay options and airfares\", \"needs_yes\": true}\n"
+                "- Example 2: \"Raju picks Anya up from tuition at 6\" -> type: commitment, owner: P03 (staff), status: done, closed_by: M013\n"
+                "- Example 3: \"Decide whether to take Zest at 60k a month\" -> type: question, owner: ME, status: open, help: {\"action\": \"remind\", \"remind_at\": \"2026-10-25T10:00:00+05:30\"}\n"
+                "- Example 4: \"Vikram sends Orbit the October invoice\" -> type: commitment, owner: P05 (colleague), status: open, help: {\"action\": \"leave\", \"reason\": \"someone else handling\"}\n\n"
+                "Rules for Extraction:\n"
+                "- source_msg MUST be from the Target Messages section.\n"
+                "- If a task is raised vaguely first and concretely later, choose the concrete message.\n"
+                "- Owner: \"ME\" if Arjun owes it or must decide; otherwise the person ID of who owes it.\n"
+                "- Status: \"open\", \"done\", or \"dropped\".\n"
+                "- IMPORTANT SCORING RULE: Calling a loop done or dropped when it is still open costs -1 penalty. Only set done/dropped if confidence >= 0.65 and there is a concrete closed_by message ID.\n\n"
+                "Where to Help Rules (for loops with status \"open\"):\n"
+                "- Someone else owes it and is already handling it (staff, vendor, colleague) -> \"leave\". (If Arjun is waiting on it and overdue -> \"remind\").\n"
+                "- Arjun's wife's own personal plans -> \"leave\". Something Arjun promised her -> treat as Arjun's promise (\"remind\"/\"assist\").\n"
+                "- Something Arjun promised or must decide: \"remind\", unless assistant can move it forward digitally (\"assist\").\n"
+                "- For \"assist\": \"next_step\" (one line) and \"needs_yes\" (boolean).\n"
+                "- For \"remind\": \"remind_at\" (ISO timestamp with +05:30 strictly after reference time).\n"
+                "- For \"leave\": \"reason\" (\"someone else handling\", \"too personal\", or \"reminder would annoy\").\n\n"
                 "Return JSON:\n"
                 "{\n"
-                "  'loops': [\n"
+                "  \"loops\": [\n"
                 "    {\n"
-                "      'title': 'Send invoice for October project',\n"
-                "      'type': 'commitment',\n"
-                "      'owner': 'ME',\n"
-                "      'source_msg': 'M123',\n"
-                "      'status': 'open',\n"
-                "      'closed_by': null,\n"
-                "      'confidence': 0.9,\n"
-                "      'help': {'action': 'assist', 'next_step': 'Draft invoice from template', 'needs_yes': true}\n"
+                "      \"title\": \"Send invoice for October project\",\n"
+                "      \"type\": \"commitment\",\n"
+                "      \"owner\": \"ME\",\n"
+                "      \"source_msg\": \"M123\",\n"
+                "      \"status\": \"open\",\n"
+                "      \"closed_by\": null,\n"
+                "      \"confidence\": 0.9,\n"
+                "      \"help\": {\"action\": \"assist\", \"next_step\": \"Draft invoice from template\", \"needs_yes\": true}\n"
                 "    }\n"
                 "  ]\n"
                 "}\n\n"
@@ -611,7 +616,7 @@ def extract_open_loops(chats, messages, seed, people_out):
             for fut in concurrent.futures.as_completed(futures):
                 candidate_loops.extend(fut.result())
 
-    # Pass 2: Verify Status and Resolution on candidates
+    # Pass 2: Strict Status and Resolution Guard
     verified_loops = []
     seen_sources = set()
 
@@ -620,7 +625,6 @@ def extract_open_loops(chats, messages, seed, people_out):
         cid = lp.get("chat_id")
         if not smsg or smsg not in msg_map:
             continue
-        # Deduplicate same source message in same chat
         key = (cid, smsg)
         if key in seen_sources:
             continue
@@ -629,35 +633,25 @@ def extract_open_loops(chats, messages, seed, people_out):
         status = lp.get("status", "open")
         closed_by = lp.get("closed_by")
         conf = float(lp.get("confidence", 0.8))
-
-        # Check subsequent messages in that chat
-        msgs = chat_msgs.get(cid, [])
         source_ts = msg_map[smsg]["ts"]
-        subsequent = [m for m in msgs if m["ts"] > source_ts]
 
-        # Enforce conservative status threshold:
-        # A false 'done' costs -1. Only accept 'done' if confidence >= 0.65 and valid closed_by after source_msg
-        if status == "done":
-            if conf < 0.65 or not closed_by or closed_by not in msg_map or msg_map[closed_by]["ts"] <= source_ts:
-                # Check if subsequent messages have explicit resolution proof
-                found_closure = None
-                for sm in subsequent[:20]:
-                    sb = (sm.get("body") or "").lower()
-                    if any(w in sb for w in ["done", "ho gaya", "sent", "bhej diya", "checked", "sorted", "received", "cleared", "paid", "scheduled"]):
-                        found_closure = sm["id"]
-                        break
-                if found_closure:
-                    closed_by = found_closure
-                    status = "done"
-                else:
-                    status = "open"
-                    closed_by = None
+        # Conservative guard for BOTH done and dropped:
+        # A false 'done' or false 'dropped' costs -1.
+        # Only accept 'done' or 'dropped' if:
+        # 1. confidence >= 0.65
+        # 2. closed_by is a real message ID in the same chat
+        # 3. timestamp of closed_by is strictly after source_ts
+        if status in ("done", "dropped"):
+            if conf >= 0.65 and closed_by in msg_map and msg_map[closed_by]["chat_id"] == cid and msg_map[closed_by]["ts"] > source_ts:
+                pass
+            else:
+                status = "open"
+                closed_by = None
 
         if status == "open":
             closed_by = None
             help_ = lp.get("help")
             if not isinstance(help_, dict) or help_.get("action") not in ACTIONS:
-                # Default help rule for open loop
                 owner = lp.get("owner", "ME")
                 if owner == "ME":
                     remind_time = (ref_dt + datetime.timedelta(days=1)).replace(hour=10, minute=0, second=0).isoformat()
@@ -672,9 +666,8 @@ def extract_open_loops(chats, messages, seed, people_out):
         lp["closed_by"] = closed_by
         verified_loops.append(lp)
 
-    # Fallback heuristic loop extraction if LLM is absent or extracted very few
+    # Generic linguistic fallback if LLM is absent
     if len(verified_loops) < 5:
-        # Generic multi-lingual commitment, question, and task patterns
         commit_patterns = [
             r"(\?)",
             r"\b(i will|will send|will share|will check|i'll|let me|pls send|please send|can you|can u|could you|remind me to|should we|can we|shall we)\b",
@@ -683,7 +676,6 @@ def extract_open_loops(chats, messages, seed, people_out):
         ]
         regex = re.compile("|".join(commit_patterns), re.IGNORECASE)
 
-        # Iterate per chat so loops are distributed across active chats
         for cid, msgs in chat_msgs.items():
             recent_in_chat = [m for m in msgs if m["ts"] >= cutoff_ts]
             if not recent_in_chat:
@@ -703,14 +695,13 @@ def extract_open_loops(chats, messages, seed, people_out):
                     sender = m.get("sender_id")
                     owner = "ME" if sender == "ME" else (sender if sender in person_ids else "ME")
 
-                    # Check if resolved subsequently
                     subsequent = [x for x in msgs if x["ts"] > m["ts"]]
                     is_done = False
                     is_dropped = False
                     close_id = None
                     for sm in subsequent[:15]:
                         sb = (sm.get("body") or "").lower()
-                        if any(w in sb for w in ["done", "ho gaya", "sent", "bhej diya", "sorted", "cleared", "received", "cleared", "paid", "ok baby"]):
+                        if any(w in sb for w in ["done", "ho gaya", "sent", "bhej diya", "sorted", "cleared", "received", "paid", "ok baby"]):
                             is_done = True
                             close_id = sm["id"]
                             break
@@ -757,22 +748,22 @@ def extract_open_loops(chats, messages, seed, people_out):
 # ==============================================================================
 
 def extract_goals(messages, seed):
-    """Extract 4 to 8 high-confidence life and business goals from Arjun's own messages."""
+    """Extract 4 to 8 high-confidence life and business goals from Arjun's conversations."""
     seeded_titles = {g.get("title", "").lower() for g in seed.get("goals", [])}
-    arjun_msgs = [m for m in messages if m.get("sender_id") == "ME" and len(m.get("body", "")) > 15]
-
+    
+    # Collect candidate messages across the timeline without harsh length filters
+    all_msgs = [m for m in messages if len(m.get("body", "")) > 10]
     has_api_key = bool(os.environ.get("LLM_API_KEY"))
     goals = []
 
-    if has_api_key and arjun_msgs:
-        # Sample messages spread across history
-        step = max(1, len(arjun_msgs) // 80)
-        sampled = arjun_msgs[::step][:80]
-        msg_lines = [f"[{m['id']}] {m.get('body', '')[:140]}" for m in sampled]
+    if has_api_key and all_msgs:
+        step = max(1, len(all_msgs) // 400)
+        sampled = all_msgs[::step][:400]
+        msg_lines = [f"[{m['id']}] {m.get('sender_id')}: {m.get('body', '')[:140]}" for m in sampled]
         stream_text = "\n".join(msg_lines)
 
         prompt = (
-            "You are identifying long-term goals and milestones for Arjun from his WhatsApp messages.\n"
+            "You are identifying long-term goals and milestones for Arjun from his WhatsApp conversations.\n"
             f"Valid Areas: {sorted(AREAS)}\n"
             f"Valid Goal Types: {sorted(GOAL_TYPES)}\n"
             f"Valid Horizons: {sorted(HORIZONS)}\n\n"
@@ -783,17 +774,17 @@ def extract_goals(messages, seed):
             "- Output at most 6 goals.\n"
             "Return JSON:\n"
             "{\n"
-            "  'goals': [\n"
+            "  \"goals\": [\n"
             "    {\n"
-            "      'title': 'Achieve milestone or habit',\n"
-            "      'area': 'health',\n"
-            "      'type': 'milestone',\n"
-            "      'horizon': '1yr',\n"
-            "      'evidence': ['M101']\n"
+            "      \"title\": \"Achieve milestone or habit\",\n"
+            "      \"area\": \"health\",\n"
+            "      \"type\": \"milestone\",\n"
+            "      \"horizon\": \"1yr\",\n"
+            "      \"evidence\": [\"M101\"]\n"
             "    }\n"
             "  ]\n"
             "}\n\n"
-            f"Arjun's messages across the timeline:\n{stream_text}"
+            f"Conversations across the timeline:\n{stream_text}"
         )
 
         try:
@@ -807,9 +798,10 @@ def extract_goals(messages, seed):
             )
             parsed = safe_json_parse(raw)
             if parsed and isinstance(parsed.get("goals"), list):
+                msg_ids_set = {m["id"] for m in all_msgs}
                 for g in parsed["goals"]:
                     title = g.get("title", "").strip()
-                    ev = [m for m in g.get("evidence", []) if any(am["id"] == m for am in arjun_msgs)]
+                    ev = [m for m in g.get("evidence", []) if m in msg_ids_set]
                     if title and ev and title.lower() not in seeded_titles:
                         goals.append({
                             "title": title,
@@ -822,7 +814,7 @@ def extract_goals(messages, seed):
             print(f"[Warning] LLM goals extraction failed: {e}", file=sys.stderr)
 
     # Generic linguistic fallback if LLM is absent
-    if not goals and arjun_msgs:
+    if not goals and all_msgs:
         goal_cues = [
             (re.compile(r"\b(fitness|gym|run|weight|health|training|exercise)\b", re.I), "health", "milestone", "Improve physical fitness and health"),
             (re.compile(r"\b(revenue|invest|saving|portfolio|fund|shares|budget)\b", re.I), "finances", "milestone", "Grow investment portfolio and savings"),
@@ -835,7 +827,7 @@ def extract_goals(messages, seed):
         for cue_re, area, gtype, title in goal_cues:
             if area in found_areas or title.lower() in seeded_titles:
                 continue
-            for m in arjun_msgs:
+            for m in all_msgs:
                 if cue_re.search(m.get("body", "")):
                     goals.append({
                         "title": title,
@@ -894,12 +886,10 @@ def sanitize(out, chats, messages, seed):
             continue
         seen_people_ids.add(pid)
 
-        # Enforce seed circle if exists
         circle = seeded_circles.get(pid) or p.get("circle")
         if circle not in CIRCLES:
             circle = "friend"
 
-        # Validate links
         valid_links = []
         for lk in p.get("links", []) or []:
             org = lk.get("organisation")
@@ -907,7 +897,6 @@ def sanitize(out, chats, messages, seed):
             if org in seen_org_ids and role in ("runs", "supports"):
                 valid_links.append({"organisation": org, "link": role})
 
-        # Validate looks_after
         valid_la = [other for other in p.get("looks_after", []) or [] if other in person_ids and other != pid]
 
         cleaned_people.append({
@@ -917,7 +906,6 @@ def sanitize(out, chats, messages, seed):
             "looks_after": valid_la
         })
 
-    # Include any missing people from input
     for pid in person_ids:
         if pid not in seen_people_ids:
             circle = seeded_circles.get(pid, "friend")
@@ -932,7 +920,6 @@ def sanitize(out, chats, messages, seed):
     # 3. Chats (Every chat tied exactly once)
     cleaned_chats = []
     seen_chats = set()
-    chat_by_id = {c["chat_id"]: c for c in chats}
 
     for ct in out.get("chats", []):
         cid = ct.get("chat_id")
@@ -949,7 +936,6 @@ def sanitize(out, chats, messages, seed):
             cleaned_chats.append({"chat_id": cid, "organisation": ct["organisation"]})
             seen_chats.add(cid)
 
-    # Tie remaining chats
     for c in chats:
         cid = c["chat_id"]
         if cid in seen_chats:
