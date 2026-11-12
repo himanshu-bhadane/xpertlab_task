@@ -18,22 +18,37 @@
   - False `assist` / `remind` on `leave`: $-1$ penalty.
   - Cost curve: $\le 0.25\times$ baseline ($0.038 / 1k msgs) gives full 12 points.
 
-### Step 2: Analysis of Execution Latency & Overfitting
+### Step 2: Investigation of Execution Latency & Overfitting
 - **Investigating the 0.3s vs. 15.5m Latency Gap:**
   - The organizer baseline made 110 sequential network calls to `openai/gpt-oss-120b` via OpenRouter (processing ~490,000 tokens), taking 15.5 minutes (~8.5 seconds per request over HTTP).
-  - In our preliminary prototype, because no API key was set in the local shell, a pure in-memory regex and dictionary look-up was executed locally on disk, completing in 0.3 seconds.
-  - **Overfitting Risk:** That preliminary regex script relied on specific dev set names (`"khetan"`, `"nayna"`, `"sudar"`, etc.). In the hidden evaluation set, every single person name, company, and number is re-randomized. A hardcoded solution would completely collapse on unseen data.
+  - An early prototype executed locally in 0.3 seconds because it was an in-memory script with zero network calls.
+  - **Overfitting Risk:** That early script relied on dev-set names ("khetan", "nayna", "sudar"). In the hidden evaluation set, every single person name, company, and phone number is re-randomized.
   - **Resolution:** Reconstructed the entire system into a genuine model-driven pipeline targeting `google/gemini-3.8-flash`, removing every hardcoded name and ensuring true zero-shot semantic reasoning.
 
-### Step 3: Architecture of the Gemini 3.8 Flash Pipeline
-- **Orchestration:** Implemented `llm.py` with exponential backoff on HTTP 429 rate limits or 5xx server errors, pointing by default to `google/gemini-3.8-flash` via OpenRouter.
-- **Stage 1 (Organisations & Group Chats):** Feeds group chat metadata and seed organisations into an LLM prompt to identify companies, residences, and secondary hubs, and assigns chats accordingly.
-- **Stage 2 (People & Circles):** Summarizes each person's interaction patterns (message volume, direct message snippets, shared groups, seed circles) and prompts `google/gemini-3.8-flash` to classify into one of 12 circles and assign `runs`/`supports` links.
-- **Stage 3 (Open Loops & Where to Help):** Evaluates candidate message threads to extract tasks, commitments, deadlines, questions, followups, owner (`ME` vs contact ID), due date, status, and help action (`assist`, `remind`, `leave`).
-- **Stage 4 (Goals Discovery):** Discovers held goals backed by explicit evidence message IDs.
-- **Concurrency & Latency:** Utilizes `concurrent.futures.ThreadPoolExecutor` (3-4 workers) to batch requests concurrently, reducing evaluation runtime to ~1-2 minutes while staying well below the 30-minute ceiling.
+### Step 3: Comprehensive Hardening & Architectural Refinement (Claude Review Feedback)
+- Audited the implementation against detailed peer critique and challenge FAQ:
+  1. **LLM Robustness (`llm.py`):**
+     - Handled HTTP 400 rejection of `response_format` by retrying immediately without `response_format` and using `safe_json_parse`.
+     - Built a local disk cache (`.cache/llm/`) keyed by SHA-256 of `(model, messages, temperature)` to avoid duplicate spend during testing.
+     - Enforced thread safety around `usage.jsonl` writes using `threading.Lock()`.
+     - Raised concurrent workers to 8 for parallel chunk evaluation.
+  2. **Defensive Sanitization (`solution.py`):**
+     - Added `sanitize()` mirroring `check.validate` to prevent any invalid ID or malformed object from failing the run.
+     - Guaranteed that every chat is tied once (defaulting 1-on-1 chats to their participant and group chats to Home if unassigned).
+     - Ensured `help` objects only accompany loops with `status: "open"`.
+     - Stripped all dataset-specific keywords ("kanchan", "tadoba", "targeting", "marathon", "retainer") from fallback logic.
+  3. **Stage Reordering (People First):**
+     - Shifted people classification to run first using the most common `sender_name`, mutual conversation history, and seed circle calibration.
+     - Group chat and organisation classification then leverages the resolved member circles.
+  4. **Two-Pass Loop Extraction & Strict Help Rules:**
+     - Switched to chronological chat chunking without English keyword or message length prefilters.
+     - Implemented the 15-day scorable cutoff (`last_ts - 15 days`), using older messages as context.
+     - Conservative status threshold: requires confidence $\ge 0.65$ and explicit subsequent message evidence to mark a loop `done`.
+     - Aligned Where to Help rules verbatim with challenge FAQ.
+  5. **Timezone Normalization:**
+     - Enforced `datetime.timezone(datetime.timedelta(hours=5, minutes=30))` (IST) across all date conversions and `remind_at` timestamps.
 
 ### Step 4: Verification & Benchmarking
-- Confirmed valid schema generation using `check.py`.
-- Verified that `./run.sh` operates as the single entrypoint.
-- Synced all updated code, write-up, and session transcripts to `/Users/himanshu/Downloads/cold-start`.
+- Confirmed valid schema generation using `check.py` on both `example/` and `data/dev/`.
+- Verified that `./run.sh` operates as the single entrypoint without dependencies on clean Python 3.9+.
+- Mirrored all updated code, write-up, and session transcripts to `/Users/himanshu/Downloads/cold-start`.
